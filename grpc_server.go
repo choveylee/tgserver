@@ -39,13 +39,19 @@ func NewGrpcServer(ctx context.Context, grpcOption GrpcOption, grpcPort int) (*G
 
 	options := []grpc.ServerOption{
 		grpc.ChainUnaryInterceptor(
+			latencyServerInterceptor,
+			prometheusServerInterceptor,
+			logServerInterceptor,
 			grpcrecovery.UnaryServerInterceptor(
 				grpcrecovery.WithRecoveryHandlerContext(recoveryHandler),
 			),
+			errorServerInterceptor,
 		),
 	}
 
 	options = append(options, grpcServer.grpcOption.options...)
+
+	ReplaceGrpcLoggerV2()
 
 	grpcServer.grpcServer = grpc.NewServer(options...)
 

@@ -10,6 +10,7 @@ package tgserver
 
 import (
 	"context"
+	"time"
 
 	"google.golang.org/grpc/metadata"
 )
@@ -55,4 +56,17 @@ func GetValueFromMetaData(ctx context.Context, key string) ([]string, bool) {
 	}
 
 	return v, true
+}
+
+func GetStartTime(ctx context.Context) time.Time {
+	value, ok := GetValue(ctx, "start_time")
+	if !ok {
+		return time.Time{}
+	}
+
+	return value.(time.Time)
+}
+
+func SetStartTime(ctx context.Context, startTime time.Time) context.Context {
+	return WithValue(ctx, "start_time", startTime)
 }
