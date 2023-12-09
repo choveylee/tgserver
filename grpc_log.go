@@ -80,7 +80,7 @@ func (l *grpcLogger) V(level int) bool {
 func ReplaceGrpcLoggerV2() {
 	grpcLogger := &grpcLogger{
 		I: func() *tlog.Tevent {
-			return tlog.D(context.Background())
+			return tlog.I(context.Background())
 		},
 		W: func() *tlog.Tevent {
 			return tlog.W(context.Background())
