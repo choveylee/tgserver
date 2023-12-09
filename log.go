@@ -27,7 +27,7 @@ func logFormatter(ctx context.Context, service, method string, req interface{}, 
 	var event *tlog.Tevent
 
 	if code == codes.OK {
-		event = tlog.I(ctx)
+		event = tlog.D(ctx)
 	} else {
 		event = tlog.E(ctx).Err(err)
 	}
