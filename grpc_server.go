@@ -18,6 +18,7 @@ import (
 
 	"github.com/choveylee/tlog"
 	grpcrecovery "github.com/grpc-ecosystem/go-grpc-middleware/recovery"
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"google.golang.org/grpc"
 )
 
@@ -43,7 +44,7 @@ func StartGrpcServer(ctx context.Context, grpcOption GrpcOption, grpcPort int) {
 	}
 
 	options := []grpc.ServerOption{
-		// grpc.StatsHandler(otelgrpc.NewServerHandler()),
+		grpc.StatsHandler(otelgrpc.NewServerHandler()),
 		grpc.ChainUnaryInterceptor(
 			latencyServerInterceptor,
 			prometheusServerInterceptor,
