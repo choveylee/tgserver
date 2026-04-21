@@ -1,11 +1,3 @@
-/**
- * @Author: lidonglin
- * @Description:
- * @File:  grpc_server
- * @Version: 1.0.0
- * @Date: 2023/12/07 20:56
- */
-
 package tgserver
 
 import (
@@ -22,12 +14,17 @@ import (
 	"google.golang.org/grpc"
 )
 
+// GrpcServer holds the gRPC server and build options for lifecycle operations such as shutdown.
 type GrpcServer struct {
 	grpcOption GrpcOption
 
 	grpcServer *grpc.Server
 }
 
+// StartGrpcServer listens on grpcPort and serves gRPC until ctx is done or SIGINT/SIGTERM,
+// then calls GracefulStop. On listen failure it logs and returns.
+// Signal registration is stopped with [signal.Stop] before the function returns, so repeated
+// starts (e.g. in tests) do not accumulate handlers.
 func StartGrpcServer(ctx context.Context, grpcOption GrpcOption, grpcPort int) {
 	grpcServer := &GrpcServer{
 		grpcOption: grpcOption,
@@ -41,6 +38,7 @@ func StartGrpcServer(ctx context.Context, grpcOption GrpcOption, grpcPort int) {
 	if err != nil {
 		tlog.F(ctx).Err(err).Msgf("start grpc server (%d) err (%v).",
 			grpcPort, err)
+		return
 	}
 
 	options := []grpc.ServerOption{
@@ -68,6 +66,7 @@ func StartGrpcServer(ctx context.Context, grpcOption GrpcOption, grpcPort int) {
 
 	shutdownChan := make(chan os.Signal, 1)
 	signal.Notify(shutdownChan, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(shutdownChan)
 
 	go func() {
 		err := grpcServer.grpcServer.Serve(listener)
@@ -102,13 +101,11 @@ func StartGrpcServer(ctx context.Context, grpcOption GrpcOption, grpcPort int) {
 }
 
 func (p *GrpcServer) shutdown(ctx context.Context) error {
-	if p != nil {
+	if p == nil || p.grpcServer == nil {
 		return nil
 	}
 
-	if p.grpcServer != nil {
-		p.grpcServer.GracefulStop()
-	}
+	p.grpcServer.GracefulStop()
 
 	return nil
 }

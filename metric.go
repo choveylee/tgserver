@@ -1,11 +1,3 @@
-/**
- * @Author: lidonglin
- * @Description:
- * @File:  metric.go
- * @Version: 1.0.0
- * @Date: 2023/12/08 09:54
- */
-
 package tgserver
 
 import (
@@ -25,6 +17,6 @@ func init() {
 		[]string{"type", "service", "method", "code"},
 	)
 	if err != nil {
-		tlog.E(context.Background()).Err(err).Msgf("new http server metric err (%v).", err)
+		tlog.E(context.Background()).Err(err).Msgf("new grpc server latency metric err (%v).", err)
 	}
 }

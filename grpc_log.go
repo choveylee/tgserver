@@ -1,11 +1,3 @@
-/**
- * @Author: lidonglin
- * @Description:
- * @File:  grpc_log.go
- * @Version: 1.0.0
- * @Date: 2023/12/08 10:25
- */
-
 package tgserver
 
 import (
@@ -50,15 +42,15 @@ func (l *grpcLogger) Warningf(format string, args ...interface{}) {
 }
 
 func (l *grpcLogger) Error(args ...interface{}) {
-	l.W().Msg(fmt.Sprint(args...))
+	l.E().Msg(fmt.Sprint(args...))
 }
 
 func (l *grpcLogger) Errorln(args ...interface{}) {
-	l.W().Msg(fmt.Sprintln(args...))
+	l.E().Msg(fmt.Sprintln(args...))
 }
 
 func (l *grpcLogger) Errorf(format string, args ...interface{}) {
-	l.W().Msgf(format, args...)
+	l.E().Msgf(format, args...)
 }
 
 func (l *grpcLogger) Fatal(args ...interface{}) {
@@ -77,6 +69,7 @@ func (l *grpcLogger) V(level int) bool {
 	return level <= l.verbosity
 }
 
+// ReplaceGrpcLoggerV2 redirects gRPC's grpclog to tlog (using context.Background).
 func ReplaceGrpcLoggerV2() {
 	grpcLogger := &grpcLogger{
 		I: func() *tlog.Tevent {

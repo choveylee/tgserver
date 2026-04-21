@@ -1,11 +1,3 @@
-/**
- * @Author: lidonglin
- * @Description:
- * @File:  grpc_interceptor.go
- * @Version: 1.0.0
- * @Date: 2023/12/07 23:28
- */
-
 package tgserver
 
 import (
@@ -23,6 +15,7 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+// RPC call-shape labels for metrics and similar use.
 const (
 	Unary        = "unary"
 	ClientStream = "client_stream"
@@ -141,7 +134,9 @@ func prometheusServerInterceptor(ctx context.Context, req interface{}, info *grp
 
 	startTime := GetStartTime(ctx)
 
-	grpcServerLatency.Observe(tmetric.SinceMS(startTime), string(Unary), service, method, status.Code(err).String())
+	if grpcServerLatency != nil {
+		grpcServerLatency.Observe(tmetric.SinceMS(startTime), string(Unary), service, method, status.Code(err).String())
+	}
 
 	return resp, err
 }
