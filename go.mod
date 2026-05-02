@@ -3,8 +3,8 @@ module github.com/choveylee/tgserver
 go 1.25.0
 
 require (
-	github.com/choveylee/tlog v0.0.0-20260421003305-e455069ecd1d
-	github.com/choveylee/tmetric v0.0.0-20260412132551-59be71c2becd
+	github.com/choveylee/tlog v0.0.0-20260502054322-af6bbcc65693
+	github.com/choveylee/tmetric v0.0.0-20260502053803-579a8f7530fb
 	github.com/grpc-ecosystem/go-grpc-middleware v1.4.0
 	go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc v0.68.0
 	google.golang.org/grpc v1.80.0
@@ -15,9 +15,9 @@ require (
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cenkalti/backoff/v5 v5.0.3 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
-	github.com/choveylee/tcfg v0.0.0-20260412131155-447616287f12 // indirect
-	github.com/choveylee/terror v0.0.0-20260412130656-8315822d7ee8 // indirect
-	github.com/choveylee/ttrace v0.0.0-20260421003159-87c4816279ce // indirect
+	github.com/choveylee/tcfg v0.0.0-20260502053036-a4c795ccc946 // indirect
+	github.com/choveylee/terror v0.0.0-20260502021137-6588de2883eb // indirect
+	github.com/choveylee/ttrace v0.0.0-20260502053133-734a04e17f5a // indirect
 	github.com/felixge/httpsnoop v1.0.4 // indirect
 	github.com/getsentry/sentry-go v0.45.1 // indirect
 	github.com/go-logr/logr v1.4.3 // indirect
