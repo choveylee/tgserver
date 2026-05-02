@@ -2,6 +2,7 @@ package tgserver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -17,20 +18,23 @@ import (
 
 const defaultGracefulShutdownTimeout = 30 * time.Second
 
+// ErrNoServiceRegistrars reports that StartGrpcServer was called without any service registrars.
+var ErrNoServiceRegistrars = errors.New("no gRPC service registrars configured")
+
 type grpcLifecycleServer interface {
 	Serve(net.Listener) error
 	GracefulStop()
 	Stop()
 }
 
-// GrpcServer contains the gRPC server instance and the options used to construct it.
+// GrpcServer holds the gRPC server instance and the options used to construct it.
 type GrpcServer struct {
 	grpcOption GrpcOption
 
 	grpcServer *grpc.Server
 }
 
-func defaultServerOptions() []grpc.ServerOption {
+func defaultServerOptions(grpcOption GrpcOption) []grpc.ServerOption {
 	recoveryOptions := grpcrecovery.WithRecoveryHandlerContext(recoveryHandler)
 
 	return []grpc.ServerOption{
@@ -38,7 +42,7 @@ func defaultServerOptions() []grpc.ServerOption {
 		grpc.ChainUnaryInterceptor(
 			latencyServerInterceptor,
 			prometheusServerInterceptor,
-			logServerInterceptor,
+			newLogServerInterceptor(grpcOption.accessLog),
 			grpcrecovery.UnaryServerInterceptor(recoveryOptions),
 			errorServerInterceptor,
 		),
@@ -53,30 +57,31 @@ func defaultServerOptions() []grpc.ServerOption {
 }
 
 // StartGrpcServer starts a gRPC server on grpcPort and serves requests until ctx is canceled,
-// Serve returns an unexpected error, or the process receives SIGINT or SIGTERM. Shutdown first
-// attempts a graceful drain and then forces Stop if the drain does not complete within the
-// shutdown timeout. Signal registration is released with [signal.Stop] before the function
-// returns, so repeated invocations do not accumulate handlers.
-func StartGrpcServer(ctx context.Context, grpcOption GrpcOption, grpcPort int) {
+// Serve returns an unexpected error, or the process receives SIGINT or SIGTERM. During
+// shutdown, it first attempts a graceful drain and then forces Stop if the drain does not
+// complete within the configured timeout. Signal registration is released with [signal.Stop]
+// before the function returns so repeated invocations do not accumulate handlers.
+//
+// StartGrpcServer returns a non-nil error if no service registrars are configured, if the
+// listener cannot be created, or if Serve terminates unexpectedly.
+func StartGrpcServer(ctx context.Context, grpcOption GrpcOption, grpcPort int) error {
 	grpcServer := &GrpcServer{
 		grpcOption: grpcOption,
 	}
 
 	if len(grpcServer.grpcOption.registrars) == 0 {
-		tlog.F(ctx).Msg("No gRPC service registrars have been configured.")
+		tlog.E(ctx).Msg("gRPC server startup aborted because no service registrars are configured.")
+		return ErrNoServiceRegistrars
 	}
 
 	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", grpcPort))
 	if err != nil {
-		tlog.F(ctx).Err(err).Msgf("Failed to start the gRPC server on port %d: %v.",
-			grpcPort, err)
-		return
+		tlog.E(ctx).Err(err).Msgf("Failed to create the gRPC listener on port %d.", grpcPort)
+		return fmt.Errorf("listen on gRPC port %d: %w", grpcPort, err)
 	}
 
-	options := defaultServerOptions()
+	options := defaultServerOptions(grpcOption)
 	options = append(options, grpcServer.grpcOption.options...)
-
-	ReplaceGrpcLoggerV2()
 
 	grpcServer.grpcServer = grpc.NewServer(options...)
 
@@ -88,7 +93,7 @@ func StartGrpcServer(ctx context.Context, grpcOption GrpcOption, grpcPort int) {
 	signal.Notify(shutdownChan, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(shutdownChan)
 
-	tlog.I(ctx).Msgf("The gRPC server is listening on port %d.", grpcPort)
+	tlog.I(ctx).Msgf("gRPC server listening on %s.", listenerAddressForLog(listener))
 
 	err = serveUntilShutdown(
 		ctx,
@@ -98,8 +103,19 @@ func StartGrpcServer(ctx context.Context, grpcOption GrpcOption, grpcPort int) {
 		defaultGracefulShutdownTimeout,
 	)
 	if err != nil {
-		tlog.E(ctx).Err(err).Msgf("The gRPC server terminated unexpectedly: %v.", err)
+		tlog.E(ctx).Err(err).Msg("gRPC server terminated unexpectedly.")
+		return err
 	}
+
+	return nil
+}
+
+func listenerAddressForLog(listener net.Listener) string {
+	if listener == nil || listener.Addr() == nil {
+		return "<unknown>"
+	}
+
+	return listener.Addr().String()
 }
 
 func serveUntilShutdown(ctx context.Context, grpcServer grpcLifecycleServer, listener net.Listener, shutdownSignals <-chan os.Signal, shutdownTimeout time.Duration) error {

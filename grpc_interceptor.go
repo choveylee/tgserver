@@ -15,7 +15,7 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// RPC call-shape labels used in metrics and structured logs.
+// RPC shape labels used in metrics and structured logs.
 const (
 	Unary        = "unary"
 	ClientStream = "client_stream"
@@ -65,8 +65,9 @@ func funcFileLine(excludePKG string) (string, string, int) {
 func recoveryHandler(ctx context.Context, r interface{}) error {
 	_, file, line := funcFileLine("github.com/choveylee")
 
-	tlog.E(ctx).Msgf("Recovered from panic at %s:%d: %v.",
-		file, line, r)
+	tlog.E(ctx).
+		Detailf("panic:%v", r).
+		Msgf("Recovered from a panic in a gRPC handler at %s:%d.", file, line)
 
 	return status.Error(codes.Unknown, internalServerErrorMessage)
 }
@@ -120,7 +121,7 @@ func observeRPC(ctx context.Context, callType, fullMethod string, err error) {
 	)
 }
 
-func marshalProtoMessage(ctx context.Context, msg interface{}, name string) []byte {
+func marshalProtoMessage(ctx context.Context, msg interface{}, name string, maxBytes int) []byte {
 	protoMessage, ok := msg.(proto.Message)
 	if !ok {
 		return nil
@@ -128,11 +129,34 @@ func marshalProtoMessage(ctx context.Context, msg interface{}, name string) []by
 
 	data, err := protojson.Marshal(protoMessage)
 	if err != nil {
-		tlog.W(ctx).Err(err).Msgf("Failed to marshal the %s protobuf message: %v.", name, err)
+		tlog.W(ctx).Err(err).Msgf("Failed to marshal the %s protobuf message for access logging.", name)
 		return nil
 	}
 
-	return data
+	return truncatePayloadForLog(data, maxBytes)
+}
+
+func truncatePayloadForLog(data []byte, maxBytes int) []byte {
+	if maxBytes <= 0 || len(data) <= maxBytes {
+		return data
+	}
+
+	const suffix = "...(truncated)"
+
+	truncated := make([]byte, 0, maxBytes+len(suffix))
+	truncated = append(truncated, data[:maxBytes]...)
+	truncated = append(truncated, suffix...)
+
+	return truncated
+}
+
+func unaryAccessLogPayloads(ctx context.Context, cfg accessLogConfig, req, resp interface{}) ([]byte, []byte) {
+	if !cfg.includeUnaryPayloads {
+		return nil, nil
+	}
+
+	return marshalProtoMessage(ctx, req, "request", cfg.maxPayloadBytes),
+		marshalProtoMessage(ctx, resp, "response", cfg.maxPayloadBytes)
 }
 
 func logRPC(ctx context.Context, callType, fullMethod string, err error, reqData, respData []byte) {
@@ -160,10 +184,10 @@ func logRPC(ctx context.Context, callType, fullMethod string, err error, reqData
 		event = event.Detailf("resp:%s", string(respData))
 	}
 
-	event.Msg("gRPC request completed.")
+	event.Msg("Completed gRPC request.")
 }
 
-func normalizeServerError(err error) error {
+func normalizeServerError(ctx context.Context, fullMethod string, err error) error {
 	if err == nil {
 		return nil
 	}
@@ -172,7 +196,14 @@ func normalizeServerError(err error) error {
 		return err
 	}
 
-	return status.Error(codes.Unknown, err.Error())
+	service, method := splitMethodName(fullMethod)
+
+	tlog.E(ctx).Err(err).
+		Detailf("service:%s", service).
+		Detailf("method:%s", method).
+		Msg("Sanitized a non-status gRPC handler error before returning it to the client.")
+
+	return status.Error(codes.Unknown, internalServerErrorMessage)
 }
 
 func latencyServerInterceptor(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
@@ -187,18 +218,21 @@ func latencyStreamServerInterceptor(srv interface{}, stream grpc.ServerStream, i
 	})
 }
 
-func logServerInterceptor(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
-	resp, err := handler(ctx, req)
-	logRPC(
-		ctx,
-		Unary,
-		info.FullMethod,
-		err,
-		marshalProtoMessage(ctx, req, "req"),
-		marshalProtoMessage(ctx, resp, "resp"),
-	)
+func newLogServerInterceptor(cfg accessLogConfig) grpc.UnaryServerInterceptor {
+	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+		resp, err := handler(ctx, req)
+		reqData, respData := unaryAccessLogPayloads(ctx, cfg, req, resp)
+		logRPC(
+			ctx,
+			Unary,
+			info.FullMethod,
+			err,
+			reqData,
+			respData,
+		)
 
-	return resp, err
+		return resp, err
+	}
 }
 
 func logStreamServerInterceptor(srv interface{}, stream grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
@@ -221,9 +255,9 @@ func prometheusStreamServerInterceptor(srv interface{}, stream grpc.ServerStream
 
 func errorServerInterceptor(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
 	resp, err := handler(ctx, req)
-	return resp, normalizeServerError(err)
+	return resp, normalizeServerError(ctx, info.FullMethod, err)
 }
 
 func errorStreamServerInterceptor(srv interface{}, stream grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
-	return normalizeServerError(handler(srv, stream))
+	return normalizeServerError(stream.Context(), info.FullMethod, handler(srv, stream))
 }
