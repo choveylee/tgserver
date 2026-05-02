@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/choveylee/tlog"
 	grpcrecovery "github.com/grpc-ecosystem/go-grpc-middleware/recovery"
@@ -14,46 +15,65 @@ import (
 	"google.golang.org/grpc"
 )
 
-// GrpcServer holds the gRPC server and build options for lifecycle operations such as shutdown.
+const defaultGracefulShutdownTimeout = 30 * time.Second
+
+type grpcLifecycleServer interface {
+	Serve(net.Listener) error
+	GracefulStop()
+	Stop()
+}
+
+// GrpcServer contains the gRPC server instance and the options used to construct it.
 type GrpcServer struct {
 	grpcOption GrpcOption
 
 	grpcServer *grpc.Server
 }
 
-// StartGrpcServer listens on grpcPort and serves gRPC until ctx is done or SIGINT/SIGTERM,
-// then calls GracefulStop. On listen failure it logs and returns.
-// Signal registration is stopped with [signal.Stop] before the function returns, so repeated
-// starts (e.g. in tests) do not accumulate handlers.
+func defaultServerOptions() []grpc.ServerOption {
+	recoveryOptions := grpcrecovery.WithRecoveryHandlerContext(recoveryHandler)
+
+	return []grpc.ServerOption{
+		grpc.StatsHandler(otelgrpc.NewServerHandler()),
+		grpc.ChainUnaryInterceptor(
+			latencyServerInterceptor,
+			prometheusServerInterceptor,
+			logServerInterceptor,
+			grpcrecovery.UnaryServerInterceptor(recoveryOptions),
+			errorServerInterceptor,
+		),
+		grpc.ChainStreamInterceptor(
+			latencyStreamServerInterceptor,
+			prometheusStreamServerInterceptor,
+			logStreamServerInterceptor,
+			grpcrecovery.StreamServerInterceptor(recoveryOptions),
+			errorStreamServerInterceptor,
+		),
+	}
+}
+
+// StartGrpcServer starts a gRPC server on grpcPort and serves requests until ctx is canceled,
+// Serve returns an unexpected error, or the process receives SIGINT or SIGTERM. Shutdown first
+// attempts a graceful drain and then forces Stop if the drain does not complete within the
+// shutdown timeout. Signal registration is released with [signal.Stop] before the function
+// returns, so repeated invocations do not accumulate handlers.
 func StartGrpcServer(ctx context.Context, grpcOption GrpcOption, grpcPort int) {
 	grpcServer := &GrpcServer{
 		grpcOption: grpcOption,
 	}
 
 	if len(grpcServer.grpcOption.registrars) == 0 {
-		tlog.F(ctx).Msg("no grpc service registrar")
+		tlog.F(ctx).Msg("No gRPC service registrars have been configured.")
 	}
 
 	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", grpcPort))
 	if err != nil {
-		tlog.F(ctx).Err(err).Msgf("start grpc server (%d) err (%v).",
+		tlog.F(ctx).Err(err).Msgf("Failed to start the gRPC server on port %d: %v.",
 			grpcPort, err)
 		return
 	}
 
-	options := []grpc.ServerOption{
-		grpc.StatsHandler(otelgrpc.NewServerHandler()),
-		grpc.ChainUnaryInterceptor(
-			latencyServerInterceptor,
-			prometheusServerInterceptor,
-			logServerInterceptor,
-			grpcrecovery.UnaryServerInterceptor(
-				grpcrecovery.WithRecoveryHandlerContext(recoveryHandler),
-			),
-			errorServerInterceptor,
-		),
-	}
-
+	options := defaultServerOptions()
 	options = append(options, grpcServer.grpcOption.options...)
 
 	ReplaceGrpcLoggerV2()
@@ -68,44 +88,68 @@ func StartGrpcServer(ctx context.Context, grpcOption GrpcOption, grpcPort int) {
 	signal.Notify(shutdownChan, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(shutdownChan)
 
-	go func() {
-		err := grpcServer.grpcServer.Serve(listener)
-		if err != nil {
-			return
-		}
-	}()
+	tlog.I(ctx).Msgf("The gRPC server is listening on port %d.", grpcPort)
 
-	tlog.I(ctx).Msgf("grpc server started, listen on %d.", grpcPort)
-
-	select {
-	case <-ctx.Done():
-		err := grpcServer.shutdown(ctx)
-		if err != nil {
-			tlog.E(ctx).Err(err).Msgf("shutdown grpc server err (%v).",
-				err)
-
-			return
-		}
-
-		return
-	case <-shutdownChan:
-		err := grpcServer.shutdown(ctx)
-		if err != nil {
-			tlog.E(ctx).Err(err).Msgf("shutdown grpc server err (%v).",
-				err)
-
-			return
-		}
-		return
+	err = serveUntilShutdown(
+		ctx,
+		grpcServer.grpcServer,
+		listener,
+		shutdownChan,
+		defaultGracefulShutdownTimeout,
+	)
+	if err != nil {
+		tlog.E(ctx).Err(err).Msgf("The gRPC server terminated unexpectedly: %v.", err)
 	}
 }
 
-func (p *GrpcServer) shutdown(ctx context.Context) error {
-	if p == nil || p.grpcServer == nil {
-		return nil
+func serveUntilShutdown(ctx context.Context, grpcServer grpcLifecycleServer, listener net.Listener, shutdownSignals <-chan os.Signal, shutdownTimeout time.Duration) error {
+	serveErrChan := make(chan error, 1)
+	go func() {
+		serveErrChan <- grpcServer.Serve(listener)
+	}()
+
+	select {
+	case err := <-serveErrChan:
+		return err
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancel()
+
+		shutdownServer(shutdownCtx, grpcServer)
+	case <-shutdownSignals:
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancel()
+
+		shutdownServer(shutdownCtx, grpcServer)
 	}
 
-	p.grpcServer.GracefulStop()
+	return <-serveErrChan
+}
 
-	return nil
+func shutdownServer(ctx context.Context, grpcServer interface {
+	GracefulStop()
+	Stop()
+}) {
+	if grpcServer == nil {
+		return
+	}
+
+	done := make(chan struct{})
+	go func() {
+		grpcServer.GracefulStop()
+		close(done)
+	}()
+
+	if ctx == nil {
+		<-done
+		return
+	}
+
+	select {
+	case <-done:
+		return
+	case <-ctx.Done():
+		grpcServer.Stop()
+		<-done
+	}
 }

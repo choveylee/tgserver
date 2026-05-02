@@ -1,6 +1,6 @@
 # tgserver
 
-`tgserver` is a small Go library for starting a production-oriented [gRPC](https://grpc.io/) server with common operational plumbing: **OpenTelemetry** server metrics, **Prometheus** latency histograms, structured **access logging** (via [tlog](https://github.com/choveylee/tlog)), **panic recovery**, and helpers for **request-scoped context** values.
+`tgserver` is a Go library for building production-ready [gRPC](https://grpc.io/) servers with common operational capabilities, including **OpenTelemetry** instrumentation, **Prometheus** latency metrics, structured **access logging** (via [tlog](https://github.com/choveylee/tlog)), **panic recovery**, and **request-scoped context** helpers.
 
 ## Requirements
 
@@ -14,7 +14,7 @@ go get github.com/choveylee/tgserver
 
 ## Quick start
 
-Register your gRPC services, then call `StartGrpcServer`. The server listens on `tcp` on the given port, serves until the context is cancelled or the process receives **SIGINT** / **SIGTERM**, and then performs a **graceful stop**.
+Register your gRPC services and then call `StartGrpcServer`. The server listens on `tcp` on the specified port and continues serving until the context is canceled, `Serve` returns an unexpected error, or the process receives **SIGINT** or **SIGTERM**. Shutdown first attempts a graceful drain and then forces termination if the drain does not complete within the configured timeout.
 
 ```go
 package main
@@ -25,7 +25,7 @@ import (
 	"github.com/choveylee/tgserver"
 	"google.golang.org/grpc"
 
-	pb "example.com/proto/gen" // your generated package
+	pb "example.com/proto/gen" // Generated protobuf package.
 )
 
 type server struct {
@@ -44,7 +44,7 @@ func main() {
 }
 ```
 
-You may append extra `grpc.ServerOption` values (credentials, keepalive, message limits, etc.) with `GrpcOption.WithServerOption`.
+Additional `grpc.ServerOption` values, such as transport credentials, keepalive policies, or message size limits, may be appended with `GrpcOption.WithServerOption`.
 
 ### Functional-style registration
 
@@ -61,29 +61,29 @@ tgserver.StartGrpcServer(ctx, *opt, 50051)
 
 | Area | Behavior |
 |------|----------|
-| **Tracing / metrics** | Registers `otelgrpc.NewServerHandler()` as a gRPC stats handler. |
-| **Latency** | Unary RPC duration is recorded on a Prometheus histogram named `grpc_server_latency` (labels: `type`, `service`, `method`, `code`). Registration uses [tmetric](https://github.com/choveylee/tmetric). |
-| **Access logs** | Unary interceptors emit structured logs (method, status, latency, optional JSON request/response bodies for `proto.Message` values). |
-| **Recovery** | Panics are recovered and converted to `codes.Unknown` gRPC errors with log context. |
-| **Internal gRPC logs** | `ReplaceGrpcLoggerV2` bridges `grpclog` to `tlog`. |
+| **Tracing / metrics** | Registers `otelgrpc.NewServerHandler()` as the gRPC stats handler. |
+| **Latency** | Records unary and streaming RPC duration in a Prometheus histogram named `grpc_server_latency` with the labels `type`, `service`, `method`, and `code`. Registration is performed through [tmetric](https://github.com/choveylee/tmetric). |
+| **Access logs** | Emits structured logs for unary and streaming RPCs, including method name, status code, latency, and optional JSON request/response bodies for unary `proto.Message` values. |
+| **Recovery** | Recovers unary and streaming panics, records the panic details on the server side, and returns a generic `codes.Unknown` gRPC error to the client. |
+| **Internal gRPC logs** | Redirects `grpclog` output to `tlog` through `ReplaceGrpcLoggerV2`. |
 
-Interceptors are chained in a fixed order suitable for timing and observability (latency marker → metrics → access log → recovery → error hook).
+Unary and streaming interceptors are chained in a fixed order optimized for timing and observability: latency marker → metrics → access log → recovery → error normalization.
 
-> **Note:** Logging, metrics export, and OpenTelemetry exporters are expected to be configured in your application (for example via `tlog`, `tmetric`, and the OpenTelemetry SDK). This package wires handlers and interceptors only.
+> **Note:** Logging sinks, metrics export, and OpenTelemetry exporters are expected to be configured by the application, for example through `tlog`, `tmetric`, and the OpenTelemetry SDK. This package only wires the relevant handlers and interceptors.
 
 ## Context helpers
 
-The package provides utilities alongside standard `context` usage:
+The package also provides the following utilities alongside standard `context` usage:
 
-- **`WithValue` / `GetValue`** — attach a mutable string-keyed map to a context for intra-request data.
-- **`GetValueFromMetaData`** — read incoming gRPC metadata values.
-- **`SetStartTime` / `GetStartTime`** — store and read an RPC start time (used by interceptors for latency).
+- **`WithValue` / `GetValue`** — attach a string-keyed map to a derived context for request-scoped data without sharing mutable state across sibling contexts.
+- **`GetValueFromMetaData`** — read incoming gRPC metadata values with case-insensitive key lookup.
+- **`SetStartTime` / `GetStartTime`** — store and retrieve the RPC start time used by interceptors for latency measurement.
 
-Prefer typed `context.WithValue` keys in application code when you do not need the string-keyed map.
+When the string-keyed helper map is not required, prefer typed `context.WithValue` keys in application code.
 
 ## Documentation
 
-Package documentation is available with:
+Package documentation is available through:
 
 ```bash
 go doc github.com/choveylee/tgserver
@@ -91,4 +91,4 @@ go doc github.com/choveylee/tgserver
 
 ## Related modules
 
-This library depends on [tlog](https://github.com/choveylee/tlog) and [tmetric](https://github.com/choveylee/tmetric) for logging and metrics primitives used by interceptors and `init`-time metric registration.
+This library depends on [tlog](https://github.com/choveylee/tlog) and [tmetric](https://github.com/choveylee/tmetric) for the logging and metrics primitives used by the interceptors and by metric registration during package initialization.

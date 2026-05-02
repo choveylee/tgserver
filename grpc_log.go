@@ -69,7 +69,7 @@ func (l *grpcLogger) V(level int) bool {
 	return level <= l.verbosity
 }
 
-// ReplaceGrpcLoggerV2 redirects gRPC's grpclog to tlog (using context.Background).
+// ReplaceGrpcLoggerV2 configures gRPC's grpclog package to write through tlog using context.Background.
 func ReplaceGrpcLoggerV2() {
 	grpcLogger := &grpcLogger{
 		I: func() *tlog.Tevent {

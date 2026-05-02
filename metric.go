@@ -17,6 +17,6 @@ func init() {
 		[]string{"type", "service", "method", "code"},
 	)
 	if err != nil {
-		tlog.E(context.Background()).Err(err).Msgf("new grpc server latency metric err (%v).", err)
+		tlog.E(context.Background()).Err(err).Msgf("Failed to initialize the gRPC server latency metric: %v.", err)
 	}
 }
