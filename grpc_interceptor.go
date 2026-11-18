@@ -2,17 +2,19 @@ package tgserver
 
 import (
 	"context"
+	"errors"
 	"runtime"
 	"strings"
 	"time"
 
 	"github.com/choveylee/tlog"
-	"github.com/choveylee/tmetric"
+	"go.opentelemetry.io/otel/baggage"
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/stats"
 	"google.golang.org/grpc/status"
-	"google.golang.org/protobuf/encoding/protojson"
-	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
 // RPC shape labels used in metrics and structured logs.
@@ -23,6 +25,7 @@ const (
 	BidiStream   = "bidi_stream"
 
 	internalServerErrorMessage = "internal server error"
+	unknownRPCMethod           = "/unknown/unknown"
 )
 
 type contextServerStream struct {
@@ -31,233 +34,244 @@ type contextServerStream struct {
 	ctx context.Context
 }
 
-func (p *contextServerStream) Context() context.Context {
-	return p.ctx
+func (stream *contextServerStream) Context() context.Context {
+	return stream.ctx
 }
 
-func funcFileLine(excludePKG string) (string, string, int) {
-	const depth = 8
-	var pcs [depth]uintptr
-	n := runtime.Callers(3, pcs[:])
-	ff := runtime.CallersFrames(pcs[:n])
+// newUnaryServerInterceptor snapshots opt-in request diagnostics before the
+// handler can mutate the request, and recovers panics from the handler chain.
+func newUnaryServerInterceptor(config accessLogConfig) grpc.UnaryServerInterceptor {
+	return func(ctx context.Context, request any, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (response any, err error) {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				response = nil
+				err = recoverServerPanic(ctx, recovered)
+			}
+		}()
 
-	var fn, file string
-	var line int
+		ctx = prepareRPCContext(ctx)
+		observation, _ := ctx.Value(rpcObservationKey{}).(*rpcObservation)
+		if observation != nil && config.maxPayloadBytes > 0 {
+			observation.requestPayload = marshalProtoMessage(ctx, request, config.maxPayloadBytes)
+		}
+
+		response, err = handler(ctx, request)
+		if err == nil && observation != nil && config.maxPayloadBytes > 0 {
+			observation.responsePayload = marshalProtoMessage(ctx, response, config.maxPayloadBytes)
+		}
+
+		return response, normalizeServerError(err)
+	}
+}
+
+// streamServerInterceptor preserves the stream context and recovers panics from
+// the handler chain.
+func streamServerInterceptor(service any, stream grpc.ServerStream, _ *grpc.StreamServerInfo, handler grpc.StreamHandler) (err error) {
+	ctx := prepareRPCContext(stream.Context())
+	streamWithContext := &contextServerStream{ServerStream: stream, ctx: ctx}
+
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = recoverServerPanic(ctx, recovered)
+		}
+	}()
+
+	return normalizeServerError(handler(service, streamWithContext))
+}
+
+// prepareRPCContext attaches a deferred span while keeping gRPC transport
+// values and caller-supplied context available to the handler.
+func prepareRPCContext(ctx context.Context) context.Context {
+	observation, _ := ctx.Value(rpcObservationKey{}).(*rpcObservation)
+	if observation != nil && observation.telemetryCtx != nil {
+		ctx = trace.ContextWithSpan(ctx, trace.SpanFromContext(observation.telemetryCtx))
+		ctx = baggage.ContextWithBaggage(ctx, baggage.FromContext(observation.telemetryCtx))
+	}
+
+	return SetStartTime(ctx, time.Now())
+}
+
+// normalizeServerError preserves the explicit public gRPC status and its
+// details, and discards private context added by wrappers.
+func normalizeServerError(err error) error {
+	if err == nil {
+		return nil
+	}
+
+	var statusError interface{ GRPCStatus() *status.Status }
+	if errors.As(err, &statusError) {
+		if publicStatus := statusError.GRPCStatus(); publicStatus != nil {
+			return publicStatus.Err()
+		}
+	}
+
+	switch {
+	case errors.Is(err, context.Canceled):
+		return status.FromContextError(context.Canceled).Err()
+	case errors.Is(err, context.DeadlineExceeded):
+		return status.FromContextError(context.DeadlineExceeded).Err()
+	default:
+		return status.Error(codes.Unknown, internalServerErrorMessage)
+	}
+}
+
+// recoverServerPanic logs the panic type and its frame without serializing the value.
+func recoverServerPanic(ctx context.Context, recovered any) error {
+	var callers [16]uintptr
+	count := runtime.Callers(3, callers[:])
+	frames := runtime.CallersFrames(callers[:count])
 	for {
-		f, ok := ff.Next()
-		if !ok {
-			break
-		}
+		frame, more := frames.Next()
+		if !strings.HasPrefix(frame.Function, "runtime.") || !more {
+			tlog.E(ctx).
+				Detailf("panic type:%T", recovered).
+				Msgf("Recover gRPC handler panic (file=%s, line=%d)", frame.File, frame.Line)
 
-		fn, file, line = f.Function, f.File, f.Line
-		if !strings.Contains(fn, excludePKG) {
 			break
 		}
 	}
-
-	if index := strings.LastIndexByte(fn, '/'); index != -1 {
-		fn = fn[index+1:]
-	}
-
-	return fn, file, line
-}
-
-func recoveryHandler(ctx context.Context, r interface{}) error {
-	_, file, line := funcFileLine("github.com/choveylee")
-
-	tlog.E(ctx).
-		Detailf("panic:%v", r).
-		Msgf("Recovered from a panic in a gRPC handler at %s:%d.", file, line)
 
 	return status.Error(codes.Unknown, internalServerErrorMessage)
 }
 
-func splitMethodName(fullMethod string) (string, string) {
-	fullMethod = strings.TrimPrefix(fullMethod, "/") // remove leading slash
+type rpcObservationKey struct{}
 
-	index := strings.Index(fullMethod, "/")
-	if index >= 0 {
-		return fullMethod[:index], fullMethod[index+1:]
-	}
+type rpcObservation struct {
+	service string
+	method  string
+	rpcType string
 
-	return "unknown", "unknown"
+	unknownSince time.Time
+	telemetryCtx context.Context
+
+	requestPayload  string
+	responsePayload string
 }
 
-func streamRPCType(info *grpc.StreamServerInfo) string {
+// logRPC uses the final transport status and the same elapsed time for logs and metrics.
+func logRPC(ctx context.Context, observation *rpcObservation, code codes.Code, duration time.Duration) {
+	observeRPC(ctx, observation.rpcType, observation.service, observation.method, code.String(), duration)
+
+	var event *tlog.Tevent
+	if code == codes.OK {
+		event = tlog.I(ctx)
+	} else {
+		event = tlog.E(ctx)
+	}
+
+	event.Detailf("type:%s", observation.rpcType).
+		Detailf("service:%s", observation.service).
+		Detailf("method:%s", observation.method).
+		Detailf("latency:%v", duration).
+		Detailf("code:%s", code.String())
+
+	if observation.requestPayload != "" {
+		event.Detailf("req:%s", observation.requestPayload)
+	}
+
+	if code == codes.OK && observation.responsePayload != "" {
+		event.Detailf("resp:%s", observation.responsePayload)
+	}
+
+	event.Msg("Complete gRPC request")
+}
+
+// streamRPCType maps the method shape reported by gRPC to a telemetry label.
+func streamRPCType(clientStream, serverStream bool) string {
 	switch {
-	case info.IsClientStream && info.IsServerStream:
+	case clientStream && serverStream:
 		return BidiStream
-	case info.IsClientStream:
+	case clientStream:
 		return ClientStream
-	case info.IsServerStream:
+	case serverStream:
 		return ServerStream
 	default:
 		return Unary
 	}
 }
 
-func requestLatency(ctx context.Context) time.Duration {
-	startTime := GetStartTime(ctx)
-	if startTime.IsZero() {
-		return 0
-	}
+type grpcServerStats struct {
+	stats.Handler
 
-	return time.Since(startTime)
+	methodsMap map[string]struct{}
 }
 
-func observeRPC(ctx context.Context, callType, fullMethod string, err error) {
-	startTime := GetStartTime(ctx)
-	if startTime.IsZero() || grpcServerLatency == nil {
-		return
-	}
-
-	service, method := splitMethodName(fullMethod)
-	grpcServerLatency.Observe(
-		tmetric.SinceMS(startTime),
-		callType,
-		service,
-		method,
-		status.Code(err).String(),
-	)
-}
-
-func marshalProtoMessage(ctx context.Context, msg interface{}, name string, maxBytes int) []byte {
-	protoMessage, ok := msg.(proto.Message)
-	if !ok {
-		return nil
-	}
-
-	data, err := protojson.Marshal(protoMessage)
-	if err != nil {
-		tlog.W(ctx).Err(err).Msgf("Failed to marshal the %s protobuf message for access logging.", name)
-		return nil
-	}
-
-	return truncatePayloadForLog(data, maxBytes)
-}
-
-func truncatePayloadForLog(data []byte, maxBytes int) []byte {
-	if maxBytes <= 0 || len(data) <= maxBytes {
-		return data
-	}
-
-	const suffix = "...(truncated)"
-
-	truncated := make([]byte, 0, maxBytes+len(suffix))
-	truncated = append(truncated, data[:maxBytes]...)
-	truncated = append(truncated, suffix...)
-
-	return truncated
-}
-
-func unaryAccessLogPayloads(ctx context.Context, cfg accessLogConfig, req, resp interface{}) ([]byte, []byte) {
-	if !cfg.includeUnaryPayloads {
-		return nil, nil
-	}
-
-	return marshalProtoMessage(ctx, req, "request", cfg.maxPayloadBytes),
-		marshalProtoMessage(ctx, resp, "response", cfg.maxPayloadBytes)
-}
-
-func logRPC(ctx context.Context, callType, fullMethod string, err error, reqData, respData []byte) {
-	service, method := splitMethodName(fullMethod)
-	code := status.Code(err)
-	latency := requestLatency(ctx)
-
-	var event *tlog.Tevent
-	if code == codes.OK {
-		event = tlog.I(ctx)
+// TagRPC bounds telemetry labels to registered methods and preserves the raw
+// path for the transport and caller-supplied stats handlers.
+func (handler grpcServerStats) TagRPC(ctx context.Context, info *stats.RPCTagInfo) context.Context {
+	service, method, valid := splitMethodName(info.FullMethodName)
+	observation := &rpcObservation{service: service, method: method, rpcType: Unary}
+	if _, registered := handler.methodsMap[info.FullMethodName]; !registered || !valid {
+		// A canceled, unhandled RPC may emit neither Begin nor OutTrailer.
+		observation.service, observation.method = "unknown", "unknown"
+		observation.unknownSince = time.Now()
 	} else {
-		event = tlog.E(ctx).Err(err)
+		ctx = handler.Handler.TagRPC(ctx, info)
 	}
 
-	event = event.Detailf("type:%s", callType).
-		Detailf("service:%s", service).
-		Detailf("method:%s", method).
-		Detailf("latency:%v", latency).
-		Detailf("code:%s", code.String())
-
-	if reqData != nil {
-		event = event.Detailf("req:%s", string(reqData))
-	}
-	if respData != nil {
-		event = event.Detailf("resp:%s", string(respData))
-	}
-
-	event.Msg("Completed gRPC request.")
+	return context.WithValue(ctx, rpcObservationKey{}, observation)
 }
 
-func normalizeServerError(ctx context.Context, fullMethod string, err error) error {
-	if err == nil {
-		return nil
+// HandleRPC ends the built-in span with sanitized status and records access
+// telemetry after gRPC has encoded and attempted to send the response.
+func (handler grpcServerStats) HandleRPC(ctx context.Context, event stats.RPCStats) {
+	observation, _ := ctx.Value(rpcObservationKey{}).(*rpcObservation)
+	if observation != nil && !observation.unknownSince.IsZero() {
+		if observation.telemetryCtx == nil {
+			switch event.(type) {
+			case *stats.Begin:
+				observation.telemetryCtx = handler.Handler.TagRPC(ctx, &stats.RPCTagInfo{FullMethodName: unknownRPCMethod})
+			case *stats.OutTrailer:
+				handler.recordUnknownRejection(ctx, observation)
+
+				return
+			default:
+				return
+			}
+		}
+
+		ctx = observation.telemetryCtx
 	}
 
-	if _, ok := status.FromError(err); ok {
-		return err
+	switch rpcEvent := event.(type) {
+	case *stats.Begin:
+		if observation != nil {
+			observation.rpcType = streamRPCType(rpcEvent.IsClientStream, rpcEvent.IsServerStream)
+		}
+	case *stats.End:
+		if rpcEvent.Error != nil {
+			sanitizedEnd := *rpcEvent
+			sanitizedEnd.Error = status.Error(status.Code(rpcEvent.Error), "")
+
+			event = &sanitizedEnd
+		}
 	}
 
-	service, method := splitMethodName(fullMethod)
+	handler.Handler.HandleRPC(ctx, event)
 
-	tlog.E(ctx).Err(err).
-		Detailf("service:%s", service).
-		Detailf("method:%s", method).
-		Msg("Sanitized a non-status gRPC handler error before returning it to the client.")
-
-	return status.Error(codes.Unknown, internalServerErrorMessage)
-}
-
-func latencyServerInterceptor(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
-	return handler(SetStartTime(ctx, time.Now()), req)
-}
-
-func latencyStreamServerInterceptor(srv interface{}, stream grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
-	ctx := SetStartTime(stream.Context(), time.Now())
-	return handler(srv, &contextServerStream{
-		ServerStream: stream,
-		ctx:          ctx,
-	})
-}
-
-func newLogServerInterceptor(cfg accessLogConfig) grpc.UnaryServerInterceptor {
-	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
-		resp, err := handler(ctx, req)
-		reqData, respData := unaryAccessLogPayloads(ctx, cfg, req, resp)
-		logRPC(
-			ctx,
-			Unary,
-			info.FullMethod,
-			err,
-			reqData,
-			respData,
-		)
-
-		return resp, err
+	if end, ok := event.(*stats.End); ok && observation != nil {
+		logRPC(ctx, observation, status.Code(end.Error), end.EndTime.Sub(end.BeginTime))
 	}
 }
 
-func logStreamServerInterceptor(srv interface{}, stream grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
-	err := handler(srv, stream)
-	logRPC(stream.Context(), streamRPCType(info), info.FullMethod, err, nil, nil)
-	return err
+// recordUnknownRejection completes telemetry for the native gRPC rejection,
+// which emits OutTrailer without a Begin or End event.
+func (handler grpcServerStats) recordUnknownRejection(ctx context.Context, observation *rpcObservation) {
+	end := &stats.End{
+		BeginTime: observation.unknownSince,
+		EndTime:   time.Now(),
+		Error:     status.Error(codes.Unimplemented, ""),
+	}
+	ctx = handler.Handler.TagRPC(ctx, &stats.RPCTagInfo{FullMethodName: unknownRPCMethod})
+	handler.Handler.HandleRPC(ctx, end)
+	logRPC(ctx, observation, codes.Unimplemented, end.EndTime.Sub(end.BeginTime))
 }
 
-func prometheusServerInterceptor(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
-	resp, err := handler(ctx, req)
-	observeRPC(ctx, Unary, info.FullMethod, err)
-	return resp, err
-}
+// splitMethodName recognizes the protobuf RPC path used in telemetry.
+func splitMethodName(fullMethod string) (string, string, bool) {
+	path, prefixed := strings.CutPrefix(fullMethod, "/")
+	service, method, separated := strings.Cut(path, "/")
+	valid := prefixed && separated && protoreflect.FullName(service).IsValid() && protoreflect.Name(method).IsValid()
 
-func prometheusStreamServerInterceptor(srv interface{}, stream grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
-	err := handler(srv, stream)
-	observeRPC(stream.Context(), streamRPCType(info), info.FullMethod, err)
-	return err
-}
-
-func errorServerInterceptor(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
-	resp, err := handler(ctx, req)
-	return resp, normalizeServerError(ctx, info.FullMethod, err)
-}
-
-func errorStreamServerInterceptor(srv interface{}, stream grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
-	return normalizeServerError(stream.Context(), info.FullMethod, handler(srv, stream))
+	return service, method, valid
 }

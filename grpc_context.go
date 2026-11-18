@@ -7,69 +7,43 @@ import (
 	"google.golang.org/grpc/metadata"
 )
 
-type grpcCtx struct{}
-
-type grpcContextValues map[string]interface{}
-
+type grpcValueKey string
+type grpcContextValue struct{ value any }
 type startTimeCtxKey struct{}
 
-// WithValue returns a derived context that carries a string-keyed value map.
-// Each call copies the existing map so that sibling contexts do not share mutable state.
-func WithValue(ctx context.Context, key string, val interface{}) context.Context {
-	data, _ := ctx.Value(grpcCtx{}).(grpcContextValues)
-	copied := make(grpcContextValues, len(data)+1)
-	for k, v := range data {
-		copied[k] = v
-	}
-	copied[key] = val
+// WithValue returns a derived context with a string-keyed value. A child may
+// override the key independently of its siblings.
+func WithValue(ctx context.Context, key string, value any) context.Context {
+	stored := grpcContextValue{value: value}
 
-	return context.WithValue(ctx, grpcCtx{}, copied)
+	return context.WithValue(ctx, grpcValueKey(key), stored)
 }
 
-// GetValue returns the value associated with key, if present.
-func GetValue(ctx context.Context, key string) (interface{}, bool) {
-	data, ok := ctx.Value(grpcCtx{}).(grpcContextValues)
-	if !ok {
-		return nil, false
-	}
+// GetValue returns the value associated with key, including an explicit nil.
+func GetValue(ctx context.Context, key string) (any, bool) {
+	stored, ok := ctx.Value(grpcValueKey(key)).(grpcContextValue)
 
-	val, ok := data[key]
-	if !ok {
-		return nil, false
-	}
-
-	return val, true
+	return stored.value, ok
 }
 
-// GetValueFromMetaData returns the incoming gRPC metadata values associated with key.
-// Lookup is case-insensitive, consistent with [metadata.MD.Get].
+// GetValueFromMetaData returns a copy of the matching incoming metadata values.
 func GetValueFromMetaData(ctx context.Context, key string) ([]string, bool) {
-	data, ok := metadata.FromIncomingContext(ctx)
-	if !ok {
+	values := metadata.ValueFromIncomingContext(ctx, key)
+	if len(values) == 0 {
 		return nil, false
 	}
 
-	v := data.Get(key)
-	if len(v) == 0 {
-		return nil, false
-	}
-
-	return v, true
+	return values, true
 }
 
-// GetStartTime returns the start time recorded by SetStartTime.
-// It returns the zero value if no start time has been recorded.
+// GetStartTime returns the start time recorded by SetStartTime or the zero time.
 func GetStartTime(ctx context.Context) time.Time {
-	startTime, ok := ctx.Value(startTimeCtxKey{}).(time.Time)
-	if !ok {
-		return time.Time{}
-	}
+	startTime, _ := ctx.Value(startTimeCtxKey{}).(time.Time)
 
 	return startTime
 }
 
-// SetStartTime stores the RPC start time in ctx for interceptor use, such as latency
-// measurement.
+// SetStartTime stores the RPC start time in ctx for interceptor use.
 func SetStartTime(ctx context.Context, startTime time.Time) context.Context {
 	return context.WithValue(ctx, startTimeCtxKey{}, startTime)
 }

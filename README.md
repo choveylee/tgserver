@@ -4,7 +4,7 @@
 
 ## Requirements
 
-- **Go** 1.25 or later (see `go.mod`).
+- **Go** 1.27.4 or later.
 
 ## Installation
 
@@ -14,7 +14,9 @@ go get github.com/choveylee/tgserver
 
 ## Quick start
 
-After registering your gRPC services, call `StartGrpcServer`. The server listens on `tcp` on the specified port and continues serving until the context is canceled, `Serve` returns an unexpected error, or the process receives **SIGINT** or **SIGTERM**. During shutdown, it first attempts a graceful drain and then forces termination if in-flight RPCs do not complete within the configured timeout. The function returns an error if no services are registered, listener creation fails, or serving terminates unexpectedly.
+Call `StartGrpcServer` with service registration callbacks and a TCP port. It serves until the context is canceled, serving fails, or the process receives SIGINT or SIGTERM. Cancellation during registration stops startup after the active callback returns. Shutdown waits up to 30 seconds for in-flight RPCs by default. Change the limit with `WithGracefulShutdownTimeout`. When the limit expires, the listener and the TCP connections it still owns close, including pending handshakes. The returned error matches `context.DeadlineExceeded` through `errors.Is`. Running handlers should respond to context cancellation to complete cleanup.
+
+Set transport credentials with `WithTransportCredentials`. Custom credentials receive a `net.Conn` and must use `WithTransportCredentials` if they return `credentials.ErrConnDispatched`. This lets the listener release ownership and keep the dispatched socket open during forced shutdown. Standard TLS credentials also work with `WithServerOption(grpc.Creds(...))`.
 
 ```go
 package main
@@ -36,32 +38,32 @@ type server struct {
 func main() {
 	ctx := context.Background()
 
-	opt := tgserver.NewGrpcOption()
-	opt.WithServiceRegistrar(func(s grpc.ServiceRegistrar) {
-		pb.RegisterGreeterServer(s, &server{})
+	options := tgserver.NewGrpcOption()
+	options.WithServiceRegistrar(func(registrar grpc.ServiceRegistrar) {
+		pb.RegisterGreeterServer(registrar, &server{})
 	})
 
-	if err := tgserver.StartGrpcServer(ctx, *opt, 50051); err != nil {
+	if err := tgserver.StartGrpcServer(ctx, *options, 50051); err != nil {
 		log.Fatalf("gRPC server terminated with an error: %v", err)
 	}
 }
 ```
 
-Additional `grpc.ServerOption` values, such as transport credentials, keepalive policies, or message size limits, may be supplied with `GrpcOption.WithServerOption`.
+Use `WithServerOption` for keepalive and message size limits. Register custom interceptors with `grpc.ChainUnaryInterceptor` and `grpc.ChainStreamInterceptor` so the server's panic recovery and timing surround them. Standalone interceptor options return a startup error. Registration callbacks receive a `grpc.ServiceRegistrar`, which also supports gRPC reflection through `GetServiceInfo`. Service registration checks the implementation and takes a snapshot of the method and stream descriptors.
 
 To route gRPC's internal process-wide logs through `tlog`, call `tgserver.ReplaceGrpcLoggerV2()` during application initialization before creating other gRPC components.
 
-Unary request and response payload logging is disabled by default. If it is required for diagnostics, enable it explicitly with `GrpcOption.WithUnaryAccessLogPayloads(maxBytes)`. Serialized payloads are truncated before they are written to logs.
+Use `WithUnaryAccessLogPayloads(maxBytes)` to enable unary protobuf diagnostics. Request diagnostics capture the request before the handler runs. Redaction removes common sensitive field and map-key names, opaque byte fields, and the contents of `Any` envelopes. Each logged payload has a byte limit. For sensitive values stored under other names, keep the default metadata-only logs.
 
 ### Functional-style registration
 
 ```go
-opt := tgserver.NewGrpcOption()
-register := tgserver.WithGRPCRegister(func(s grpc.ServiceRegistrar) {
-	pb.RegisterGreeterServer(s, &server{})
+options := tgserver.NewGrpcOption()
+register := tgserver.WithGRPCRegister(func(registrar grpc.ServiceRegistrar) {
+	pb.RegisterGreeterServer(registrar, &server{})
 })
-register(opt)
-if err := tgserver.StartGrpcServer(ctx, *opt, 50051); err != nil {
+register(options)
+if err := tgserver.StartGrpcServer(ctx, *options, 50051); err != nil {
 	log.Fatalf("gRPC server terminated with an error: %v", err)
 }
 ```
@@ -70,13 +72,13 @@ if err := tgserver.StartGrpcServer(ctx, *opt, 50051); err != nil {
 
 | Area | Behavior |
 |------|----------|
-| **Tracing / metrics** | Installs `otelgrpc.NewServerHandler()` as the gRPC stats handler. |
+| **Tracing / metrics** | Installs the OpenTelemetry server stats handler with normalized method names and status codes. |
 | **Latency** | Records unary and streaming RPC duration in the `grpc_server_latency` Prometheus histogram with the labels `type`, `service`, `method`, and `code`. Registration is performed through [tmetric](https://github.com/choveylee/tmetric). |
 | **Access logs** | Emits structured logs for unary and streaming RPCs, including method name, status code, and latency. Unary request and response bodies are omitted by default and may be enabled explicitly with `GrpcOption.WithUnaryAccessLogPayloads`. |
-| **Recovery** | Recovers from unary and streaming panics, records diagnostics on the server side, and returns a generic `codes.Unknown` gRPC error to clients. Non-status handler errors are sanitized before they are returned. |
+| **Recovery** | Recovers from handler and chained-interceptor panics, logs the panic type and call site, and returns a generic `codes.Unknown` status. Explicit gRPC statuses retain their public message and details. |
 | **Internal gRPC logs** | Applications may route `grpclog` output to `tlog` explicitly by calling `ReplaceGrpcLoggerV2` during initialization. |
 
-Unary and streaming interceptors are chained in a fixed order designed for consistent timing and observability: latency marker → metrics → access log → recovery → error normalization.
+The access log and Prometheus histogram use the final gRPC completion status and duration, including response encoding and transport errors. By default, gRPC returns `Unimplemented` for unregistered methods before running interceptors. The server records these rejections under the `unknown` labels when gRPC emits trailers. A custom `grpc.UnknownServiceHandler` runs through the stream interceptor chain and uses the same bounded labels.
 
 > **Note:** Logging sinks, metrics export, and OpenTelemetry exporters are expected to be configured by the application, for example through `tlog`, `tmetric`, and the OpenTelemetry SDK. This package only wires the relevant handlers and interceptors.
 
@@ -84,7 +86,7 @@ Unary and streaming interceptors are chained in a fixed order designed for consi
 
 In addition to standard `context` usage, the package provides the following utilities:
 
-- **`WithValue` / `GetValue`** — attach a string-keyed map to a derived context for request-scoped data without sharing mutable state across sibling contexts.
+- **`WithValue` / `GetValue`** — attach a string-keyed value to a derived context. Children can override a key independently.
 - **`GetValueFromMetaData`** — read incoming gRPC metadata values with case-insensitive key lookup.
 - **`SetStartTime` / `GetStartTime`** — store and retrieve the RPC start time used by interceptors for latency measurement.
 
